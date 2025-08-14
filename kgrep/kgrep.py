@@ -11,7 +11,7 @@ It applies position-specific rules (via --mask or --rule) and performs
 bounded, prefix-guided scans to minimize IO, using iterate_lower_bound /
 iterate_upper_bound and prefix_same_as_start when available.
 
-Default alphabet : DNA = b"ACGT"
+Default alphabet : "ACGT". You can override with --alphabet.
 
 Typical uses
 ------------
@@ -69,10 +69,6 @@ import sys
 from typing import List, Dict, Iterable, Tuple, Optional
 
 from rocksdict import Rdict, Options, ReadOptions
-
-# Default alphabet for DNA. You can override with --alphabet.
-DNA = b"ACGT"
-
 
 # ---------- Portable helpers over rocksdict API differences ----------
 def _try_call(obj, candidates: Iterable[str], *args) -> bool:
