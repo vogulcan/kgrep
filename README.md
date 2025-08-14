@@ -2,7 +2,7 @@
 
 **Fast positional k-mer grep over RocksDict / RocksDB**
 
-`kgrep` is a high-performance tool for scanning k-mers in a RocksDict/RocksDB database with position-specific filtering rules.  
+`kgrep` is a tool for scanning k-mers in a RocksDict/RocksDB database with position-specific filtering rules.  
 It uses tight prefix-bounded scans and in-memory constraint checks to minimize I/O and maximize speed.
 
 ## Features
@@ -84,4 +84,5 @@ to see all options.
 ## License
 
 MIT License — see repository for details.
+
 
