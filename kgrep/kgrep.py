@@ -4,7 +4,8 @@ kgrep.py — Fast positional k-mer grep over RocksDict/RocksDB.
 
 This script scans a RocksDict/RocksDB where:
 - Keys are fixed-length k-mers (bytes/ASCII).
-- Values are counts (big-endian u32, little-endian u64, or ASCII int).
+- Values are counts (auto-inferred as ASCII int, little-endian u64, or big-endian u32),
+  unless explicitly overridden via flags.
 
 It applies position-specific rules (via --mask or --rule) and performs
 bounded, prefix-guided scans to minimize IO, using iterate_lower_bound /
@@ -14,20 +15,18 @@ Default alphabet : DNA = b"ACGT"
 
 Typical uses
 ------------
-- Mask syntax with count filter: (See below on masking rules.)
-    uv run main.py --db /path/dbfolder --mask "A[CT]?AA" \
-        --values-are-u32-be --min-count 10
+- Mask syntax with count filter (auto-infer values):
+    kgrep --db /dbpath/dbfolder --mask "A[CT]?AA" --min-count 10
 
-- Rule syntax with output file:
-    uv run main.py --db /path/dbfolder --values-are-u32-be --rule "1:A;2:CT" \
+- Rule syntax with output file (explicit override if needed):
+    kgrep --db /dbpath/dbfolder --rule "1:A;2:CT" --values-are-u32-be \
                --min-count 1 --output output.txt
 
-- Basic k-mer search without constraints: (Lists all)
-    uv run main.py --db /path/dbfolder --k 10
+- Basic k-mer search without constraints (lists all):
+    kgrep --db /dbpath/dbfolder --k 10
 
 - Complex rule with multiple positions:
-    uv run main.py --db /path/dbfolder --rule "3:A;5:CG;10:T" \
-               --values-are-u64 --limit 1000
+    kgrep --db /dbpath/dbfolder --rule "3:A;5:CG;10:T" --limit 1000
 
 Mask syntax table
 =================
@@ -40,12 +39,21 @@ G          Exact match for a single required character (here: 'G')
 
 =================
 
+Value decoding (auto-inference order)
+-------------------------------------
+1) If the value bytes look like an ASCII integer (e.g., b"123\\n"), parse as ASCII.
+2) Else if length==8, parse as little-endian unsigned 64-bit.
+3) Else if length==4, parse as big-endian unsigned 32-bit.
+4) Else leave as unknown (printed without a count unless --min-count filters it out).
+
+Flags --values-are-u32-be / --values-are-u64, if provided, override inference.
+
 Design notes
 ------------
 - We enumerate only as many prefix combinations as needed (bounded by --max-enum).
 - For each enumerated prefix, we seek to a tight (lo, hi) range and iterate.
 - Within that range, we still verify full per-position constraints in-memory.
-- Value decoding supports multiple encodings; ASCII fallback is tolerant.
+- Value decoding supports multiple encodings; ASCII-first inference is safest.
 
 Caveats
 -------
@@ -70,10 +78,6 @@ DNA = b"ACGT"
 def _try_call(obj, candidates: Iterable[str], *args) -> bool:
     """
     Attempt to call the first available method from `candidates` on `obj`.
-
-    This smooths over version/API diffs between rocksdict bindings:
-    some environments expose `set_iterate_lower_bound`, others `iterate_lower_bound`, etc.
-
     Returns:
         True if a candidate method exists and was invoked, else False.
     """
@@ -88,7 +92,6 @@ def _try_call(obj, candidates: Iterable[str], *args) -> bool:
 def _set_bound(ro: ReadOptions, kind: str, key: bytes) -> None:
     """
     Set iterate lower/upper bound in a portable way.
-
     Args:
         ro: ReadOptions
         kind: "lower" or "upper"
@@ -100,8 +103,7 @@ def _set_bound(ro: ReadOptions, kind: str, key: bytes) -> None:
     else:
         if _try_call(ro, ["set_iterate_upper_bound", "iterate_upper_bound"], key):
             return
-    # If neither bound setter exists, we proceed without bounds.
-    # NOTE: This is unusual; performance will degrade but correctness remains.
+    # If neither bound setter exists, we proceed without bounds (correct but slower).
 
 
 # ---------- Rule parsing ----------
@@ -120,14 +122,6 @@ def parse_rules(args: argparse.Namespace, k: int, alphabet: bytes) -> Dict[int, 
 
     Rule syntax:
         "3:A;5:CG;10:T"  -> position: allowed set
-
-    Args:
-        args: parsed CLI args
-        k: k-mer length (for clipping; out-of-range positions ignored)
-        alphabet: default allowed set for unconstrained positions
-
-    Returns:
-        Dict mapping 1-based position -> sorted bytes of allowed characters.
     """
     if args.mask:
         pos = 1
@@ -136,15 +130,15 @@ def parse_rules(args: argparse.Namespace, k: int, alphabet: bytes) -> Dict[int, 
         rules: Dict[int, bytes] = {}
         while i < len(s):
             c = s[i]
-            if c == '?':
+            if c == "?":
                 pos += 1
                 i += 1
                 continue
-            if c == '[':
-                j = s.find(']', i + 1)
+            if c == "[":
+                j = s.find("]", i + 1)
                 if j == -1:
                     raise ValueError("Unclosed '[' in --mask")
-                allowed = s[i + 1 : j].encode('ascii').upper()
+                allowed = s[i + 1 : j].encode("ascii").upper()
                 rules[pos] = bytes(sorted(set(allowed)))
                 pos += 1
                 i = j + 1
@@ -155,16 +149,15 @@ def parse_rules(args: argparse.Namespace, k: int, alphabet: bytes) -> Dict[int, 
             i += 1
         return rules
 
-    # --rule pathway
     rules: Dict[int, bytes] = {}
     if args.rule:
-        for term in args.rule.split(';'):
+        for term in args.rule.split(";"):
             term = term.strip()
             if not term:
                 continue
-            p_str, vals = term.split(':', 1)
+            p_str, vals = term.split(":", 1)
             p = int(p_str)
-            allowed = bytes(sorted(set(vals.upper().encode('ascii'))))
+            allowed = bytes(sorted(set(vals.upper().encode("ascii"))))
             rules[p] = allowed
     return rules
 
@@ -183,11 +176,6 @@ def choose_prefix_len(
       - enumerations would exceed --max-enum, OR
       - we covered the last constrained position (early exit), OR
       - we reached k.
-
-    This balances enumeration cost vs scan tightness.
-
-    Returns:
-        P in [0..k]. P=0 means no explicit prefix enumeration.
     """
     if not rules:
         return 0
@@ -202,18 +190,14 @@ def choose_prefix_len(
         if combos > max_enum:
             return P - 1  # previous P fits within the enumeration budget
         if pos >= last_constrained:
-            # We already pinned every constrained position in the prefix;
-            # no need to go further.
             return P
     return P
 
 
-def enumerated_prefixes(P: int, rules: Dict[int, bytes], alphabet: bytes) -> Iterable[bytes]:
-    """
-    Yield all prefixes of length P consistent with the given rules.
-
-    For P=0, yields a single empty prefix (i.e., full keyspace).
-    """
+def enumerated_prefixes(
+    P: int, rules: Dict[int, bytes], alphabet: bytes
+) -> Iterable[bytes]:
+    """Yield all prefixes of length P consistent with the given rules."""
     if P <= 0:
         yield b""
         return
@@ -226,7 +210,6 @@ def enumerated_prefixes(P: int, rules: Dict[int, bytes], alphabet: bytes) -> Ite
 def build_allowed_arrays(k: int, rules: Dict[int, bytes]) -> List[Optional[bytes]]:
     """
     Build a random-access array of allowed sets per 1-based position.
-
     Index 0 is unused to allow 1-based indexing: arr[pos] -> allowed bytes or None.
     """
     arr: List[Optional[bytes]] = [None] * (k + 1)
@@ -239,16 +222,10 @@ def build_allowed_arrays(k: int, rules: Dict[int, bytes]) -> List[Optional[bytes
 def match_kmer_bytes(kmer: bytes, allowed_by_pos: List[Optional[bytes]]) -> bool:
     """
     Check whether a k-mer (bytes) satisfies per-position allowed sets.
-
-    Args:
-        kmer: key bytes of length k
-        allowed_by_pos: list where each entry is None (no constraint)
-                        or a bytes object containing the allowed set.
-
-    Returns:
-        True if all constrained positions pass, else False.
     """
-    for i, allowed in enumerate(allowed_by_pos[1:], start=0):  # i: 0-based index into kmer
+    for i, allowed in enumerate(
+        allowed_by_pos[1:], start=0
+    ):  # i: 0-based index into kmer
         if allowed is None:
             continue
         if kmer[i] not in allowed:
@@ -260,10 +237,6 @@ def match_kmer_bytes(kmer: bytes, allowed_by_pos: List[Optional[bytes]]) -> bool
 def upper_bound_for_prefix(prefix: bytes) -> bytes:
     """
     Compute the exclusive upper bound key for a given prefix.
-
-    RocksDB iterators treat upper bounds as exclusive. We increment the
-    last non-0xFF byte to get the smallest key strictly greater than any
-    key starting with `prefix`. If all bytes are 0xFF, append a NUL.
     """
     p = bytearray(prefix)
     for i in reversed(range(len(p))):
@@ -279,34 +252,129 @@ def seek_range_for_prefix(prefix: bytes, k: int) -> Tuple[bytes, bytes]:
     with that prefix and total length k.
 
     lo: prefix + NUL padding up to k (inclusive lower bound)
-    hi: exclusive upper bound computed from prefix
+    hi: exclusive upper bound computed from prefix (or top of space if prefix empty)
     """
+    if len(prefix) == 0:
+        # Full keyspace of fixed-length k-mers
+        lo = b"\x00" * k
+        # Smallest key strictly greater than any k-length key
+        hi = upper_bound_for_prefix(b"\xff" * k)  # -> b"\xff"*k + b"\x00"
+        return lo, hi
+
     lo = prefix + b"\x00" * (k - len(prefix))
     hi = upper_bound_for_prefix(prefix)
     return lo, hi
 
 
+# ---------- Value decoding (auto-infer with optional overrides) ----------
+def _looks_like_ascii_int(b: bytes) -> Optional[int]:
+    """
+    Try to parse ASCII integer safely. Accepts surrounding whitespace and an optional sign.
+    Returns the parsed int on success, else None.
+    """
+    try:
+        s = b.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError:
+        return None
+    if not s:
+        return None
+    # Quick character check (digits + optional sign)
+    if s[0] in "+-":
+        core = s[1:]
+    else:
+        core = s
+    if not core or any(ch not in "0123456789" for ch in core):
+        return None
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+
+def decode_count(val: bytes, args: argparse.Namespace) -> Optional[int]:
+    """
+    Decode value to an integer count.
+    Override precedence (if flags given):
+      - --values-are-u64 : interpret as little-endian u64
+      - --values-are-u32-be : interpret as big-endian u32
+    Otherwise auto-infer: ASCII int -> len==8 (u64 LE) -> len==4 (u32 BE) -> None
+    """
+    # Explicit overrides
+    if args.values_are_u64:
+        if len(val) != 8:
+            # Try to be tolerant: fall back to ASCII if possible
+            ascii_int = _looks_like_ascii_int(val)
+            return ascii_int
+        return int.from_bytes(val, "little", signed=False)
+
+    if args.values_are_u32_be:
+        if len(val) != 4:
+            ascii_int = _looks_like_ascii_int(val)
+            return ascii_int
+        return int.from_bytes(val, "big", signed=False)
+
+    # Auto-infer
+    ascii_int = _looks_like_ascii_int(val)
+    if ascii_int is not None:
+        return ascii_int
+    if len(val) == 8:
+        return int.from_bytes(val, "little", signed=False)
+    if len(val) == 4:
+        return int.from_bytes(val, "big", signed=False)
+    return None
+
+
 # ---------- Main entrypoint ----------
 def main() -> None:
-    ap = argparse.ArgumentParser(description="k-mer rule grep over RocksDict")
+    ap = argparse.ArgumentParser(
+        description="k-mer rule grep over RocksDict (auto-infers value encoding)"
+    )
     ap.add_argument("--db", required=True, help="Path to RocksDict / RocksDB")
-    ap.add_argument("--cf", default=None, help="Column family name (default CF if omitted)")
-    ap.add_argument("--k", type=int, help="k-mer length in bytes (auto from first key if omitted)")
+    ap.add_argument(
+        "--cf", default=None, help="Column family name (default CF if omitted)"
+    )
+    ap.add_argument(
+        "--k", type=int, help="k-mer length in bytes (auto from first key if omitted)"
+    )
     ap.add_argument("--rule", help='Rules like "3:A;5:CG;10:T"', default=None)
-    ap.add_argument("--mask", help='Compact mask like "A[CT]?G??T" (?=any, [..]=set)', default=None)
+    ap.add_argument(
+        "--mask", help='Compact mask like "A[CT]?G??T" (?=any, [..]=set)', default=None
+    )
     ap.add_argument("--alphabet", default="ACGT", help="Alphabet, default ACGT")
-    ap.add_argument("--min-count", type=int, default=0, help="Only output k-mers with count >= this")
-    ap.add_argument("--max-enum", type=int, default=200000, help="Max prefix combinations to enumerate")
-    ap.add_argument("--limit", type=int, default=0, help="Stop after N matches (0 = unlimited)")
+    ap.add_argument(
+        "--min-count", type=int, default=0, help="Only output k-mers with count >= this"
+    )
+    ap.add_argument(
+        "--max-enum",
+        type=int,
+        default=200000,
+        help="Max prefix combinations to enumerate",
+    )
+    ap.add_argument(
+        "--limit", type=int, default=0, help="Stop after N matches (0 = unlimited)"
+    )
+    # Flags remain optional—only needed to override inference
     ap.add_argument(
         "--values-are-u32-be",
         action="store_true",
-        help="Interpret value as big-endian u32 count (builder used struct.pack('>I', cnt))",
+        help="Override: interpret value as big-endian u32 count",
     )
-    ap.add_argument("--values-are-u64", action="store_true", help="Interpret value as little-endian u64 count")
-    ap.add_argument("--no-raw", action="store_true", help="Open without raw_mode (use if your DB isn’t raw bytes)")
-    ap.add_argument("--readahead", type=int, default=8 << 20, help="Iterator readahead bytes")
-    ap.add_argument("--pin", action="store_true", help="Pin data blocks during iteration")
+    ap.add_argument(
+        "--values-are-u64",
+        action="store_true",
+        help="Override: interpret value as little-endian u64 count",
+    )
+    ap.add_argument(
+        "--no-raw",
+        action="store_true",
+        help="Open without raw_mode (use if your DB isn’t raw bytes)",
+    )
+    ap.add_argument(
+        "--readahead", type=int, default=8 << 20, help="Iterator readahead bytes"
+    )
+    ap.add_argument(
+        "--pin", action="store_true", help="Pin data blocks during iteration"
+    )
     ap.add_argument("--async-io", action="store_true", help="Use async IO for iterator")
     ap.add_argument(
         "--output",
@@ -316,13 +384,11 @@ def main() -> None:
     args = ap.parse_args()
 
     # --- Open DB / CF ---
-    # Prefer raw_mode for performance with binary keys; disable if your DB stores other encodings.
     opts = Options() if args.no_raw else Options(raw_mode=True)
     db = Rdict(args.db, options=opts)
     cf = db if args.cf is None else db.get_column_family(args.cf)
 
     # --- Infer k if absent ---
-    # We peek at the first key to derive length. Empty DB is a hard error.
     if args.k is None:
         it = iter(cf.keys())
         try:
@@ -345,13 +411,9 @@ def main() -> None:
 
     # --- Configure read options for tight, prefix-bounded scans ---
     ro = ReadOptions()
-    # Readahead (useful for sequential scans over a bounded key range)
     _try_call(ro, ["set_readahead_size", "readahead_size"], args.readahead)
-    # Restrict iteration within the key prefix if a prefix extractor is configured
     _try_call(ro, ["set_prefix_same_as_start", "prefix_same_as_start"], True)
-    # Prefer prefix/index-guided seeks over total-order scans
     _try_call(ro, ["set_total_order_seek", "total_order_seek"], False)
-    # Optional speed knobs
     if args.async_io:
         _try_call(ro, ["set_async_io", "async_io"], True)
     if args.pin:
@@ -382,31 +444,16 @@ def main() -> None:
             key = it.key()
 
             # Exit this prefix range early once we step out of the (lo, hi) window.
-            # - len(key) != k: skip malformed entries (defensive check).
-            # - not key.startswith(pref): we moved past this prefix.
             if len(key) != k or not key.startswith(pref):
                 break
 
             # Apply per-position constraints cheaply in-memory.
             if match_kmer_bytes(key, allowed_by_pos):
                 val = it.value()
-                cnt: Optional[int] = None
-
-                # Decode value per chosen format (fall back to ASCII int)
-                if args.values_are_u32_be and len(val) == 4:
-                    cnt = int.from_bytes(val, "big", signed=False)
-                elif args.values_are_u64 and len(val) == 8:
-                    cnt = int.from_bytes(val, "little", signed=False)
-                else:
-                    try:
-                        cnt = int(val)
-                    except Exception:
-                        # Leave as None => treat as "unknown count" and print if not filtering it out.
-                        cnt = None
+                cnt = decode_count(val, args)
 
                 # If we couldn't decode a count, we still print the k-mer unless min-count excludes it.
                 if cnt is None or cnt >= args.min_count:
-                    # Keys may be ASCII (preferred) or arbitrary bytes.
                     try:
                         s = key.decode("ascii")
                     except UnicodeDecodeError:
