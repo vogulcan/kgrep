@@ -9,6 +9,7 @@ It uses tight prefix-bounded scans and in-memory constraint checks to minimize I
 
 - Supports **mask** syntax (wildcards, allowed sets, exact matches).
 - Supports **rule** syntax for position-specific constraints.
+- `--rule` supports **OR** logic (multiple rule groups, matched if any group passes).
 - Optimized RocksDB iteration with prefix bounds (`iterate_lower_bound`, `iterate_upper_bound`).
 - Configurable enumeration limit to balance performance and completeness.
 - DNA alphabet by default (`ACGT`), but can be overridden.
@@ -49,6 +50,16 @@ kgrep --db /path/dbfolder
 kgrep --db /path/dbfolder --rule "3:A;5:CG;10:T" --limit 1000
 ```
 
+### 5. OR logic between rule groups
+
+```bash
+# Example: match (7:A AND 8:A) OR (17:T AND 18:T)
+kgrep --db /path/dbfolder --rule "7:A;8:A|17:T;18:T"
+
+# Same as above, using multiple --rule flags:
+kgrep --db /path/dbfolder --rule "7:A;8:A" --rule "17:T;18:T"
+```
+
 ## Mask Syntax
 
 | Symbol  | Meaning |
@@ -84,5 +95,6 @@ to see all options.
 ## License
 
 MIT License — see repository for details.
+
 
 
