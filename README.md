@@ -11,10 +11,6 @@ It uses tight prefix-bounded scans and in-memory constraint checks to minimize I
 - Supports **rule** syntax for position-specific constraints.
 - Optimized RocksDB iteration with prefix bounds (`iterate_lower_bound`, `iterate_upper_bound`).
 - Configurable enumeration limit to balance performance and completeness.
-- Multiple value decoding modes:
-  - Big-endian unsigned 32-bit
-  - Little-endian unsigned 64-bit
-  - ASCII integer fallback
 - DNA alphabet by default (`ACGT`), but can be overridden.
 - Optional output to file.
 
@@ -88,3 +84,4 @@ to see all options.
 ## License
 
 MIT License — see repository for details.
+
