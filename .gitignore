@@ -1,0 +1,37 @@
+# Python cache/bytecode
+__pycache__/
+*.py[oc]
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+*.tar.gz
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+
+# Test DB folders and RocksDB artifacts
+db*/
+*.sst
+*.log
+LOG
+LOG.*
+MANIFEST-*
+OPTIONS-*
+CURRENT
+IDENTITY
+rocksdict-config.json
+
+# Local config / lock files
+uv.lock
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Python version
+.python-version

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kgrep"
+version = "0.1.0"
+description = "Fast positional k-mer grep over RocksDict/RocksDB"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Veysel Ogulcan Kaya", email = "vogulcan@sabanciuniv.edu" }
+]
+keywords = ["bioinformatics", "kmer", "rocksdb", "dna", "grep"]
+
+dependencies = [
+    "rocksdict>=0.3.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/vogulcan/kgrep"
+
+[project.scripts]
+kgrep = "kgrep:main"            # calls kgrep/__init__.py:main()
+
+[tool.uv]
+package = true
