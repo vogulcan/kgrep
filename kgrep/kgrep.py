@@ -15,18 +15,18 @@ Default alphabet : DNA = b"ACGT"
 Typical uses
 ------------
 - Mask syntax with count filter: (See below on masking rules.)
-    uv run main.py --db /dbpath/dbfolder --mask "A[CT]?AA" \
+    uv run main.py --db /path/dbfolder --mask "A[CT]?AA" \
         --values-are-u32-be --min-count 10
 
 - Rule syntax with output file:
-    uv run main.py --db /dbpath/dbfolder --values-are-u32-be --rule "1:A;2:CT" \
+    uv run main.py --db /path/dbfolder --values-are-u32-be --rule "1:A;2:CT" \
                --min-count 1 --output output.txt
 
 - Basic k-mer search without constraints: (Lists all)
-    uv run main.py --db /dbpath/dbfolder --k 10
+    uv run main.py --db /path/dbfolder --k 10
 
 - Complex rule with multiple positions:
-    uv run main.py --db /dbpath/dbfolder --rule "3:A;5:CG;10:T" \
+    uv run main.py --db /path/dbfolder --rule "3:A;5:CG;10:T" \
                --values-are-u64 --limit 1000
 
 Mask syntax table
