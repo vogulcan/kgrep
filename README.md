@@ -60,6 +60,34 @@ kgrep --db /path/dbfolder --rule "7:A;8:A|17:T;18:T"
 kgrep --db /path/dbfolder --rule "7:A;8:A" --rule "17:T;18:T"
 ```
 
+### 6. Chunk retrieval (exact lookups for N kmers)
+Retrieve values for an explicit list of kmers (all must have the same length):
+```bash
+# Inline ASCII kmers (comma-separated or multiple flags)
+kgrep --db /path/dbfolder --chunks AAAAC --chunks TTTTG,CCCCA
+
+# From a file (one kmer per line; lines starting with '#' are ignored)
+kgrep --db /path/dbfolder --chunks-file kmers.txt
+
+# From STDIN
+cat kmers.txt | kgrep --db /path/dbfolder --chunks-file -
+
+# Hex input (for non-ASCII keys); 0x prefix optional
+kgrep --db /path/dbfolder --chunks-hex --chunks 0x4141414143 --chunks 7474745447
+```
+#### Notes for chunk retrieval:
+
+- If `--k` is not provided, k is inferred from the provided kmers.
+- If no kmers are provided, it falls back to the length of the first key in the DB (original behavior).
+- Values are decoded per `--values` (default auto), and filtered with `--min-count` if a numeric value is available.
+- Output for each found key is either:
+    - `<key>\t<count>` when a numeric value is decoded, or
+    - `<key>` if `--values none` is used or the value cannot be decoded.
+- Non-ASCII keys are printed in hex.
+- Missing keys are skipped silently (no output line).
+- Duplicates are de-duplicated.
+- `--limit` still applies to the number of printed lines.
+
 ## Mask Syntax
 
 | Symbol  | Meaning |
@@ -75,10 +103,11 @@ Positions in masks are **1-based**.
 - The script chooses an optimal prefix length to enumerate (`--max-enum` controls limit).
 - Prefix scanning is bounded tightly (`lo, hi`) to minimize iteration cost.
 - Works best with RocksDB prefix extractor enabled and `prefix_same_as_start` set.
+- Chunk retrieval uses direct iterator seeks for each provided key (fast exact lookups) and respects the same decoding/filters.
 
 ## Caveats
 
-- If keys are not raw bytes or ASCII k-mers, use `--no-raw`.
+- If keys are not raw bytes or ASCII k-mers, use `--no-raw` or provide inputs with `--chunks-hex`.
 - DB should contain fixed-length k-mers as keys.
 - Performance degrades without bound setters.
 

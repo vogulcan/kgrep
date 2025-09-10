@@ -287,6 +287,72 @@ class ValueDecoder:
         return ValueDecoder(best_mode)
 
 
+# ---------- Chunk retrieval helpers ----------
+def _read_chunks_from_file(path: str) -> List[str]:
+    if path == "-":
+        data = sys.stdin.read()
+    else:
+        with open(path, "r") as fh:
+            data = fh.read()
+    chunks: List[str] = []
+    for line in data.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        chunks.append(s)
+    return chunks
+
+
+def _normalize_chunk_strings(items: List[str]) -> List[str]:
+    # Keep bytes exactly as provided (do NOT uppercase/transform),
+    # but allow comma-separated inputs inside a single argument.
+    out: List[str] = []
+    for it in items:
+        if "," in it:
+            out.extend([p for p in (x.strip() for x in it.split(",")) if p])
+        else:
+            if it:
+                out.append(it)
+    return out
+
+
+def load_chunk_keys(args: argparse.Namespace) -> List[bytes]:
+    items: List[str] = []
+    if args.chunks:
+        items.extend(args.chunks)
+    if args.chunks_file:
+        items.extend(_read_chunks_from_file(args.chunks_file))
+    if not items:
+        return []
+    items = _normalize_chunk_strings(items)
+
+    keys: List[bytes] = []
+    if args.chunks_hex:
+        for s in items:
+            s2 = s[2:] if s.lower().startswith("0x") else s
+            try:
+                keys.append(bytes.fromhex(s2))
+            except ValueError:
+                sys.stderr.write(f"[kgrep] warning: could not parse hex kmer '{s}' – skipping\n")
+    else:
+        for s in items:
+            try:
+                keys.append(s.encode("ascii", "strict"))
+            except UnicodeEncodeError:
+                sys.stderr.write(f"[kgrep] warning: non-ASCII kmer '{s}' – skipping\n")
+    return keys
+
+
+def ensure_same_length(keys: List[bytes]) -> Optional[int]:
+    if not keys:
+        return None
+    lens = {len(k) for k in keys}
+    if len(lens) != 1:
+        sys.stderr.write("[kgrep] error: provided kmers are not the same length\n")
+        sys.exit(2)
+    return next(iter(lens))
+
+
 # ---------- Main ----------
 def main() -> None:
     ap = argparse.ArgumentParser(description="k-mer grep over RocksDict")
@@ -306,13 +372,32 @@ def main() -> None:
     ap.add_argument("--pin", action="store_true")
     ap.add_argument("--async-io", action="store_true")
     ap.add_argument("--output", default=None)
+
+    # ------- New: chunk retrieval options -------
+    ap.add_argument("--chunks", action="append", default=None,
+                    help="List of kmers to retrieve (ASCII). Can be provided multiple times or comma-separated.")
+    ap.add_argument("--chunks-file", default=None,
+                    help="Path to file with one kmer per line (use '-' for stdin).")
+    ap.add_argument("--chunks-hex", action="store_true",
+                    help="Interpret provided kmers as hex-encoded bytes (0x prefix optional).")
+    # --------------------------------------------
+
     args = ap.parse_args()
 
     opts = Options() if args.no_raw else Options(raw_mode=True)
     db = Rdict(args.db, options=opts)
     cf = db if args.cf is None else db.get_column_family(args.cf)
 
-    if args.k is None:
+    # Load chunks (if any) BEFORE determining k
+    chunk_keys: List[bytes] = load_chunk_keys(args)
+
+    # Determine k
+    if args.k is not None:
+        k = args.k
+    elif chunk_keys:
+        k = ensure_same_length(chunk_keys) or 0
+    else:
+        # fall back to infer from first key in DB (original behavior)
         it = iter(cf.keys())
         try:
             first_key = next(it)
@@ -320,9 +405,8 @@ def main() -> None:
             print("DB empty", file=sys.stderr)
             sys.exit(2)
         k = len(first_key)
-    else:
-        k = args.k
 
+    # Alphabet (used only for rule/mask enumeration)
     if str(args.alphabet).lower() == "auto":
         alphabet = guess_alphabet(cf, k)
         sys.stderr.write(f"[kgrep] alphabet=auto → inferred {alphabet.decode('ascii', 'ignore')}\n")
@@ -331,6 +415,7 @@ def main() -> None:
         if not alphabet:
             alphabet = b"ACGT"
 
+    # Rule groups (for scan mode)
     rule_groups = parse_rules_or(args)
     sanitized_groups: List[Dict[int, bytes]] = []
     for g in rule_groups:
@@ -342,15 +427,19 @@ def main() -> None:
     allowed_groups = [build_allowed_arrays(k, g) for g in rule_groups]
     user_provided_rules = bool(args.mask or args.rule)
 
-    prefixes_set: Set[bytes] = set()
-    if not rule_groups:
-        prefixes = [b""]
+    # Output setup
+    out = sys.stdout
+    _fh = None
+    if args.output:
+        _fh = open(args.output, "w")
+        out = _fh
+
+    # Value decoder
+    if args.values == "auto":
+        decoder = ValueDecoder.infer_from_cf(cf)
+        sys.stderr.write(f"[kgrep] values=auto → inferred {decoder.mode}\n")
     else:
-        for g in rule_groups:
-            P_g = choose_prefix_len(g, k, args.max_enum, alphabet)
-            for pref in enumerated_prefixes(P_g, g, alphabet):
-                prefixes_set.add(pref)
-        prefixes = sorted(prefixes_set) if prefixes_set else [b""]
+        decoder = ValueDecoder(args.values)
 
     ro = ReadOptions()
     _try_call(ro, ["set_readahead_size", "readahead_size"], args.readahead)
@@ -365,20 +454,68 @@ def main() -> None:
     _try_call(ro, ["set_tailing", "tailing"], False)
     _try_call(ro, ["set_fill_cache", "fill_cache"], False)
 
-    out = sys.stdout
-    _fh = None
-    if args.output:
-        _fh = open(args.output, "w")
-        out = _fh
-
-    if args.values == "auto":
-        decoder = ValueDecoder.infer_from_cf(cf)
-        sys.stderr.write(f"[kgrep] values=auto → inferred {decoder.mode}\n")
-    else:
-        decoder = ValueDecoder(args.values)
-
     printed = 0
     seen_keys: Set[bytes] = set()  # deduplication
+
+    # --------------- New: CHUNK RETRIEVAL MODE ---------------
+    if chunk_keys:
+        # Validate lengths vs k
+        bad = [kk for kk in chunk_keys if len(kk) != k]
+        if bad:
+            sys.stderr.write(f"[kgrep] error: some provided kmers have length != {k}\n")
+            db.close()
+            if _fh:
+                _fh.close()
+            sys.exit(2)
+
+        it = cf.iter(ro)
+        for kmer in chunk_keys:
+            if kmer in seen_keys:
+                continue
+            seen_keys.add(kmer)
+
+            # Seek to exact key using iterator for maximum API compatibility
+            it.seek(kmer)
+            if it.valid() and it.key() == kmer:
+                val = it.value()
+                cnt = None if decoder.mode == "none" else decoder.decode(val)
+                if cnt is None or cnt >= args.min_count:
+                    try:
+                        s_key = kmer.decode("ascii")
+                    except UnicodeDecodeError:
+                        s_key = kmer.hex()
+                    if cnt is None:
+                        # Keep original semantics: if values=none, print only key
+                        print(f"{s_key}", file=out)
+                    else:
+                        print(f"{s_key}\t{cnt}", file=out)
+                    printed += 1
+                    if args.limit and printed >= args.limit:
+                        db.close()
+                        if _fh:
+                            _fh.close()
+                        return
+            else:
+                # Key not present: still emit a line indicating absence?
+                # Preserve non-intrusive behavior: just skip silently.
+                continue
+
+        db.close()
+        if _fh:
+            _fh.close()
+        return
+    # --------------- End: CHUNK RETRIEVAL MODE ---------------
+
+    # --------- Original scan/enumeration mode (unchanged) ---------
+    prefixes_set: Set[bytes] = set()
+    if not rule_groups:
+        prefixes = [b""]
+    else:
+        for g in rule_groups:
+            P_g = choose_prefix_len(g, k, args.max_enum, alphabet)
+            for pref in enumerated_prefixes(P_g, g, alphabet):
+                prefixes_set.add(pref)
+        prefixes = sorted(prefixes_set) if prefixes_set else [b""]
 
     for pref in prefixes:
         lo, hi = seek_range_for_prefix(pref, k)
