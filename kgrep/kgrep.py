@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import itertools
+import io
+import os
 import re
 import sys
-from typing import List, Dict, Iterable, Tuple, Optional, Set
+from collections import OrderedDict, deque
+from typing import Iterable, Iterator, List, Dict, Tuple, Optional, Set
 
-from rocksdict import Rdict, Options, ReadOptions
+from rocksdict import Rdict, Options, ReadOptions, AccessType
 
 
-# ---------- Helpers for rocksdict API differences ----------
+# ---------- rocksdict helpers ----------
 def _try_call(obj, candidates: Iterable[str], *args) -> bool:
     for name in candidates:
         fn = getattr(obj, name, None)
@@ -20,7 +22,6 @@ def _try_call(obj, candidates: Iterable[str], *args) -> bool:
                 fn(*args)
                 return True
             except TypeError:
-                # Signature mismatch on this variant; try next
                 continue
     return False
 
@@ -34,7 +35,7 @@ def _set_bound(ro: ReadOptions, kind: str, key: bytes) -> None:
             return
 
 
-# ---------- Rule parsing (supports OR groups) ----------
+# ---------- rule parsing (scan mode) ----------
 _TERM_RE = re.compile(r"^\s*\d+\s*:\s*[!-~]+\s*$")
 
 
@@ -45,9 +46,7 @@ def _parse_rule_group(group: str) -> Dict[int, bytes]:
         return rules
     for term in group.split(";"):
         term = term.strip()
-        if not term:
-            continue
-        if not _TERM_RE.match(term):
+        if not term or not _TERM_RE.match(term):
             continue
         p_str, vals = term.split(":", 1)
         try:
@@ -55,9 +54,8 @@ def _parse_rule_group(group: str) -> Dict[int, bytes]:
         except ValueError:
             continue
         allowed = bytes(sorted(set(vals.upper().encode("ascii", "ignore"))))
-        if not allowed:
-            continue
-        rules[p] = allowed
+        if allowed:
+            rules[p] = allowed
     return rules
 
 
@@ -100,7 +98,7 @@ def parse_rules_or(args: argparse.Namespace) -> List[Dict[int, bytes]]:
     return groups
 
 
-# ---------- Alphabet inference (optional) ----------
+# ---------- alphabet inference (scan mode) ----------
 PRINTABLE_UPPER = set(range(65, 91))
 PRINTABLE = set(range(32, 127))
 
@@ -131,7 +129,7 @@ def guess_alphabet(cf, k: int, sample: int = 512) -> bytes:
     return b"ACGT"
 
 
-# ---------- Prefix planning ----------
+# ---------- scan helpers ----------
 def choose_prefix_len(rules: Dict[int, bytes], k: int, max_enum: int, alphabet: bytes) -> int:
     if not rules:
         return 0
@@ -154,11 +152,11 @@ def enumerated_prefixes(P: int, rules: Dict[int, bytes], alphabet: bytes) -> Ite
         yield b""
         return
     slots = [rules.get(pos, alphabet) for pos in range(1, P + 1)]
-    for tup in itertools.product(*slots):
+    import itertools as _it
+    for tup in _it.product(*slots):
         yield bytes(tup)
 
 
-# ---------- Fast checking ----------
 def build_allowed_arrays(k: int, rules: Dict[int, bytes]) -> List[Optional[bytes]]:
     arr: List[Optional[bytes]] = [None] * (k + 1)
     for pos, allowed in rules.items():
@@ -185,7 +183,7 @@ def match_kmer_bytes_any(kmer: bytes, groups: List[List[Optional[bytes]]], *, us
     return False
 
 
-# ---------- Bounds ----------
+# ---------- bounds ----------
 def upper_bound_for_prefix(prefix: bytes) -> bytes:
     p = bytearray(prefix)
     for i in reversed(range(len(p))):
@@ -205,7 +203,7 @@ def seek_range_for_prefix(prefix: bytes, k: int) -> Tuple[bytes, bytes]:
     return lo, hi
 
 
-# ---------- Value decoding ----------
+# ---------- value decoding ----------
 def _looks_like_ascii_int(b: bytes) -> Optional[int]:
     try:
         s = b.decode("ascii", errors="strict").strip()
@@ -291,78 +289,103 @@ class ValueDecoder:
         return ValueDecoder(best_mode)
 
 
-# ---------- Chunk retrieval helpers ----------
-def _read_chunks_from_file(path: str) -> List[str]:
-    if path == "-":
-        data = sys.stdin.read()
-    else:
-        with open(path, "r") as fh:
-            data = fh.read()
-    chunks: List[str] = []
-    for line in data.splitlines():
+# ---------- chunk input streaming ----------
+def _iter_chunks_from_path(path: str) -> Iterator[str]:
+    with open(path, "r", buffering=1024 * 1024) as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            yield s
+
+
+def _iter_chunks_from_stdin() -> Iterator[str]:
+    data_stream = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="ignore", line_buffering=False)
+    for line in data_stream:
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        chunks.append(s)
-    return chunks
+        yield s
 
 
-def _normalize_chunk_strings(items: List[str]) -> List[str]:
-    # Keep bytes exactly as provided (do NOT uppercase/transform),
-    # but allow comma-separated inputs inside a single argument.
-    out: List[str] = []
-    for it in items:
-        if "," in it:
-            out.extend([p for p in (x.strip() for x in it.split(",")) if p])
-        else:
-            if it:
-                out.append(it)
-    return out
-
-
-def load_chunk_keys(args: argparse.Namespace) -> List[bytes]:
-    items: List[str] = []
+def _iter_ascii_chunks(args: argparse.Namespace) -> Iterator[bytes]:
+    # inline --chunks first (if any), then file/stdin
     if args.chunks:
-        items.extend(args.chunks)
+        for item in args.chunks:
+            parts = (p.strip() for p in item.split(","))
+            for s in parts:
+                if s:
+                    try:
+                        yield s.encode("ascii", "strict")
+                    except UnicodeEncodeError:
+                        sys.stderr.write(f"[kgrep] warning: non-ASCII kmer '{s}' – skipping\n")
     if args.chunks_file:
-        items.extend(_read_chunks_from_file(args.chunks_file))
-    if not items:
-        return []
-    items = _normalize_chunk_strings(items)
+        if args.chunks_file == "-":
+            for s in _iter_chunks_from_stdin():
+                try:
+                    yield s.encode("ascii", "strict")
+                except UnicodeEncodeError:
+                    sys.stderr.write(f"[kgrep] warning: non-ASCII kmer '{s}' – skipping\n")
+        else:
+            for s in _iter_chunks_from_path(args.chunks_file):
+                try:
+                    yield s.encode("ascii", "strict")
+                except UnicodeEncodeError:
+                    sys.stderr.write(f"[kgrep] warning: non-ASCII kmer '{s}' – skipping\n")
 
-    keys: List[bytes] = []
-    if args.chunks_hex:
-        for s in items:
+
+def _iter_hex_chunks(args: argparse.Namespace) -> Iterator[bytes]:
+    if args.chunks:
+        for item in args.chunks:
+            parts = (p.strip() for p in item.split(","))
+            for s in parts:
+                if not s:
+                    continue
+                s2 = s[2:] if s.lower().startswith("0x") else s
+                try:
+                    yield bytes.fromhex(s2)
+                except ValueError:
+                    sys.stderr.write(f"[kgrep] warning: could not parse hex kmer '{s}' – skipping\n")
+    if args.chunks_file:
+        src = _iter_chunks_from_stdin() if args.chunks_file == "-" else _iter_chunks_from_path(args.chunks_file)
+        for s in src:
             s2 = s[2:] if s.lower().startswith("0x") else s
             try:
-                keys.append(bytes.fromhex(s2))
+                yield bytes.fromhex(s2)
             except ValueError:
                 sys.stderr.write(f"[kgrep] warning: could not parse hex kmer '{s}' – skipping\n")
+
+
+def iter_chunk_keys(args: argparse.Namespace) -> Iterator[bytes]:
+    if args.chunks_hex:
+        yield from _iter_hex_chunks(args)
     else:
-        for s in items:
-            try:
-                keys.append(s.encode("ascii", "strict"))
-            except UnicodeEncodeError:
-                sys.stderr.write(f"[kgrep] warning: non-ASCII kmer '{s}' – skipping\n")
-    return keys
+        yield from _iter_ascii_chunks(args)
 
 
-def ensure_same_length(keys: List[bytes]) -> Optional[int]:
-    if not keys:
-        return None
-    lens = {len(k) for k in keys}
-    if len(lens) != 1:
-        sys.stderr.write("[kgrep] error: provided kmers are not the same length\n")
-        sys.exit(2)
-    return next(iter(lens))
+def count_lines_in_file(path: str) -> int:
+    # Count non-empty, non-comment lines for progress %
+    n = 0
+    with open(path, "rb", buffering=1024 * 1024) as fh:
+        for raw in fh:
+            if not raw:
+                continue
+            # quick check: skip blank or '#'
+            if raw[:1] == b"\n" or raw[:1] == b"#":
+                # still need to skip lines that are just spaces
+                # (rare) – fall back to strip for those small cases
+                s = raw.strip()
+                if not s or s.startswith(b"#"):
+                    continue
+            n += 1
+    return n
 
 
-# ---------- Reverse-complement helpers ----------
+# ---------- reverse complement ----------
 _RC_TABLE = bytes.maketrans(b"ACGTacgt", b"TGCAtgca")
 
 
 def reverse_complement_bytes(seq: bytes) -> Optional[bytes]:
-    """Return reverse-complement for ASCII A/C/G/T strings; None if other chars present."""
     if not seq:
         return b""
     for bch in seq:
@@ -371,35 +394,26 @@ def reverse_complement_bytes(seq: bytes) -> Optional[bytes]:
     return seq.translate(_RC_TABLE)[::-1]
 
 
-# ---------- Point lookup helper with robust get & caching ----------
+# ---------- robust point get with positive-only cache ----------
 def _is_byteslike(x) -> bool:
     return isinstance(x, (bytes, bytearray, memoryview))
 
 
 class Prober:
-    """
-    Fast point lookups with caching. Uses cf.get if available (robust to different
-    signatures), otherwise falls back to iterator seek. Caches results for both
-    k and rc(k) to avoid duplicate work (big speed-up with --rc).
-    """
     def __init__(self, cf, ro: ReadOptions, allow_rc: bool, chunks_hex: bool, k: int):
         self.cf = cf
         self.ro = ro
-        self.allow_rc = allow_rc
-        self.rc_enabled = allow_rc and not chunks_hex  # rc disabled for hex inputs
+        self.rc_enabled = bool(allow_rc and not chunks_hex)
         self.k = k
         self._get_fn = getattr(cf, "get", None)
         self._cache: Dict[bytes, Tuple[bool, Optional[bytes], Optional[bytes]]] = {}
-        # maps key -> (found?, found_key, value_bytes)
 
         if allow_rc and chunks_hex:
             sys.stderr.write("[kgrep] --rc ignored for hex inputs; cannot compute reverse complement.\n")
 
     def _point_get(self, key: bytes) -> Optional[bytes]:
-        # Prefer direct get if available (much faster than iterator seek for point lookups)
         fn = self._get_fn
         if callable(fn):
-            # Try common signatures; accept only bytes-like or None results
             for args in ((key,), (key, self.ro), (self.ro, key)):
                 try:
                     val = fn(*args)
@@ -411,9 +425,6 @@ class Prober:
                     if isinstance(val, memoryview):
                         return val.tobytes()
                     return val
-                # If result is not bytes-like (e.g., returns ReadOptions due to wrong arg order),
-                # keep trying other signatures.
-        # Fallback: iterator seek
         it = self.cf.iter(self.ro)
         it.seek(key)
         if it.valid() and it.key() == key:
@@ -421,28 +432,21 @@ class Prober:
         return None
 
     def probe(self, kmer: bytes) -> Tuple[bool, Optional[bytes], Optional[bytes]]:
-        """
-        Returns (found, found_key, value_bytes).
-        found_key is the DB key that matched (kmer or its rc).
-        """
         cached = self._cache.get(kmer)
         if cached is not None:
             return cached
 
-        # Try exact
         val = self._point_get(kmer)
         if val is not None:
             res = (True, kmer, val)
             self._cache[kmer] = res
             return res
 
-        # Try RC if enabled
         if self.rc_enabled:
             rc = reverse_complement_bytes(kmer)
             if rc is not None and len(rc) == self.k:
                 cached_rc = self._cache.get(rc)
                 if cached_rc is not None:
-                    # Mirror to kmer key as well
                     self._cache[kmer] = cached_rc
                     return cached_rc
                 val_rc = self._point_get(rc)
@@ -452,12 +456,26 @@ class Prober:
                     self._cache[rc] = res
                     return res
 
-        res = (False, None, None)
-        self._cache[kmer] = res
-        return res
+        return (False, None, None)  # no negative caching
 
 
-# ---------- Main ----------
+# ---------- bounded output de-dup ----------
+class LRUSet:
+    def __init__(self, capacity: int):
+        self.cap = max(1, capacity)
+        self.od = OrderedDict()
+
+    def add(self, key: bytes) -> bool:
+        if key in self.od:
+            self.od.move_to_end(key)
+            return False
+        self.od[key] = None
+        if len(self.od) > self.cap:
+            self.od.popitem(last=False)
+        return True
+
+
+# ---------- main ----------
 def main() -> None:
     ap = argparse.ArgumentParser(description="k-mer grep over RocksDict")
     ap.add_argument("--db", required=True)
@@ -472,52 +490,233 @@ def main() -> None:
     ap.add_argument("--values", default="auto",
                     choices=["auto", "ascii", "u32le", "u32be", "u64le", "u64be", "none"])
     ap.add_argument("--no-raw", action="store_true")
-    ap.add_argument("--readahead", type=int, default=8 << 20)
+    ap.add_argument("--readahead", type=int, default=0,  # 0 is best for point lookups
+                    help="Readahead bytes for iterators (0 is typical for point lookups).")
     ap.add_argument("--pin", action="store_true")
     ap.add_argument("--async-io", action="store_true")
     ap.add_argument("--output", default=None)
     ap.add_argument("--read-only", action="store_true",
                     help="Open DB in read-only mode (allows parallel readers without taking the lock).")
 
-    # ------- Chunk retrieval options -------
+    # chunk retrieval options
     ap.add_argument("--chunks", action="append", default=None,
-                    help="List of kmers to retrieve (ASCII). Can be provided multiple times or comma-separated.")
+                    help="ASCII kmers to retrieve; can be repeated or comma-separated.")
     ap.add_argument("--chunks-file", default=None,
                     help="Path to file with one kmer per line (use '-' for stdin).")
     ap.add_argument("--chunks-hex", action="store_true",
                     help="Interpret provided kmers as hex-encoded bytes (0x prefix optional).")
     ap.add_argument("--progress", action="store_true",
                     help="Show progress on stderr during chunk retrieval.")
-    ap.add_argument("--progress-step", type=int, default=5,
-                    help="Update progress every N percent (1-100) when --progress is set.")
+    ap.add_argument("--progress-step", type=int, default=100,
+                    help="Update progress every N percent when --progress is set (default 100).")
     ap.add_argument("--rc", action="store_true",
-                    help="If exact kmer not found, try reverse-complement lookup (ACGT only).")
-    # --------------------------------------
+                    help="If exact kmer not found, try reverse-complement (ACGT only).")
+
+    # performance / memory knobs
+    ap.add_argument("--assume-unique", action="store_true",
+                    help="Assume inputs are unique; do not allocate input dedup structures.")
+    ap.add_argument("--no-output-dedup", action="store_true",
+                    help="Do not de-duplicate outputs (print every hit).")
+    ap.add_argument("--buffer-size", type=int, default=10_000,
+                    help="Batch size for buffered stdout writes in chunk retrieval.")
+    ap.add_argument("--output-lru", type=int, default=200_000,
+                    help="LRU size for output de-dup when enabled.")
 
     args = ap.parse_args()
 
+    # open DB
     opts = Options() if args.no_raw else Options(raw_mode=True)
-
-    # Try to open read-only if requested and supported
-    try:
-        db = Rdict(args.db, options=opts, read_only=bool(args.read_only))
-    except TypeError:
-        if args.read_only:
-            sys.stderr.write("[kgrep] --read-only requested but not supported by this rocksdict version.\n")
+    if args.read_only:
+        db = Rdict(args.db, options=opts, access_type=AccessType.read_only())
+    else:
         db = Rdict(args.db, options=opts)
-
     cf = db if args.cf is None else db.get_column_family(args.cf)
 
-    # Load chunks (if any) BEFORE determining k
-    chunk_keys: List[bytes] = load_chunk_keys(args)
+    # value decoder
+    if args.values == "auto":
+        decoder = ValueDecoder.infer_from_cf(cf)
+        sys.stderr.write(f"[kgrep] values=auto → inferred {decoder.mode}\n")
+    else:
+        decoder = ValueDecoder(args.values)
 
-    # Determine k
+    # output
+    out = sys.stdout
+    _fh = None
+    if args.output:
+        _fh = open(args.output, "w", buffering=1024 * 1024)
+        out = _fh
+
+    # ReadOptions for point lookups
+    ro = ReadOptions()
+    _try_call(ro, ["set_readahead_size", "readahead_size"], args.readahead)
+    _try_call(ro, ["set_prefix_same_as_start", "prefix_same_as_start"], True)
+    _try_call(ro, ["set_total_order_seek", "total_order_seek"], False)
+    if args.async_io:
+        _try_call(ro, ["set_async_io", "async_io"], True)
+    if args.pin:
+        _try_call(ro, ["set_pin_data", "pin_data"], True)
+    _try_call(ro, ["set_verify_checksums", "verify_checksums"], False)
+    _try_call(ro, ["set_ignore_range_deletions", "ignore_range_deletions"], True)
+    _try_call(ro, ["set_tailing", "tailing"], False)
+    _try_call(ro, ["set_fill_cache", "fill_cache"], False)
+
+    # --------------- CHUNK RETRIEVAL (streaming) ---------------
+    if args.chunks or args.chunks_file:
+        # Determine k:
+        # prefer user-specified; otherwise peek the first kmer from the stream;
+        # if nothing provided, fall back to DB's first key length.
+        stream = iter_chunk_keys(args)
+
+        first: Optional[bytes] = None
+        try:
+            first = next(stream)
+        except StopIteration:
+            # no inputs; fall back to DB-based k (for consistency with original behavior)
+            if args.k is None:
+                it = iter(cf.keys())
+                try:
+                    first_key = next(it)
+                except StopIteration:
+                    print("DB empty", file=sys.stderr)
+                    sys.exit(2)
+                k = len(first_key)
+            else:
+                k = args.k
+            # nothing to do
+            db.close()
+            if _fh:
+                _fh.close()
+            return
+
+        # compute k
+        if args.k is not None:
+            k = args.k
+        else:
+            k = len(first)
+
+        # progress: line count only if file path (not stdin)
+        total_inputs: Optional[int] = None
+        if args.progress:
+            if args.chunks_file and args.chunks_file != "-":
+                try:
+                    total_inputs = count_lines_in_file(args.chunks_file)
+                except Exception:
+                    total_inputs = None  # fallback to count-only progress
+            else:
+                total_inputs = None
+
+        prober = Prober(cf, ro, allow_rc=args.rc, chunks_hex=args.chunks_hex, k=k)
+
+        # output de-dup (optional)
+        use_output_dedup = not args.no_output_dedup
+        lru_outputs = LRUSet(capacity=max(1, int(args.output_lru))) if use_output_dedup else None
+
+        # counters & buffers
+        show_progress = bool(args.progress)
+        step = args.progress_step if 1 <= args.progress_step <= 100 else 100
+        next_threshold = step
+        seen = 0
+        found = 0
+        printed = 0
+        bufsize = max(1, int(args.buffer_size))
+        outbuf = deque()
+
+        # process the first item then the rest
+        def process_one(kmer: bytes) -> None:
+            nonlocal found, printed
+            if len(kmer) != k:
+                # strict length check (keep behavior predictable)
+                return
+            ok, db_key, db_val = prober.probe(kmer)
+            if not ok:
+                return
+            found += 1
+            # optional de-dup by DB key
+            if lru_outputs is not None:
+                if db_key is None or not lru_outputs.add(db_key):
+                    return
+            # decode + buffer print
+            vb: Optional[bytes]
+            if isinstance(db_val, bytearray):
+                vb = bytes(db_val)
+            elif isinstance(db_val, memoryview):
+                vb = db_val.tobytes()
+            else:
+                vb = db_val
+            cnt = None if decoder.mode == "none" else decoder.decode(vb)  # type: ignore[arg-type]
+            try:
+                s_key = db_key.decode("ascii") if db_key is not None else ""  # type: ignore[union-attr]
+            except UnicodeDecodeError:
+                s_key = db_key.hex() if db_key is not None else ""  # type: ignore[union-attr]
+            if cnt is None:
+                outbuf.append(f"{s_key}\n")
+            else:
+                if cnt >= args.min_count:
+                    outbuf.append(f"{s_key}\t{cnt}\n")
+                else:
+                    return
+            if len(outbuf) >= bufsize:
+                out.writelines(outbuf)
+                outbuf.clear()
+                if _fh:
+                    out.flush()
+            printed += 1
+
+        # first element
+        seen += 1
+        process_one(first)
+        # rest of stream
+        for kmer in stream:
+            seen += 1
+            process_one(kmer)
+
+            if args.limit and printed >= args.limit:
+                break
+
+            if show_progress:
+                if total_inputs:
+                    pct = int(seen * 100 / total_inputs)
+                    if pct >= next_threshold or seen == total_inputs:
+                        sys.stderr.write(f"\r[kgrep] chunks: {seen}/{total_inputs} ({pct}%)")
+                        sys.stderr.flush()
+                        while next_threshold <= pct:
+                            next_threshold += step
+                else:
+                    # count-only progress (no %)
+                    if seen % (100_000) == 0:
+                        sys.stderr.write(f"\r[kgrep] chunks: {seen}")
+                        sys.stderr.flush()
+
+        # final flush
+        if outbuf:
+            out.writelines(outbuf)
+            outbuf.clear()
+            if _fh:
+                out.flush()
+        if show_progress:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        # not-found report (per-line, since we assume unique)
+        not_found = seen - found
+        if total_inputs is not None and total_inputs != seen:
+            # in case of early --limit or parse skips
+            total_display = seen
+        else:
+            total_display = seen
+        sys.stderr.write(f"[kgrep] not found: {not_found}/{total_display}\n")
+        sys.stderr.flush()
+
+        db.close()
+        if _fh:
+            _fh.close()
+        return
+
+    # --------------- SCAN / ENUMERATION MODE (unchanged logic) ---------------
+    # determine k (for scan mode)
     if args.k is not None:
         k = args.k
-    elif chunk_keys:
-        k = ensure_same_length(chunk_keys) or 0
     else:
-        # fall back to infer from first key in DB (original behavior)
         it = iter(cf.keys())
         try:
             first_key = next(it)
@@ -526,7 +725,6 @@ def main() -> None:
             sys.exit(2)
         k = len(first_key)
 
-    # Alphabet (used only for rule/mask enumeration)
     if str(args.alphabet).lower() == "auto":
         alphabet = guess_alphabet(cf, k)
         sys.stderr.write(f"[kgrep] alphabet=auto → inferred {alphabet.decode('ascii', 'ignore')}\n")
@@ -535,7 +733,6 @@ def main() -> None:
         if not alphabet:
             alphabet = b"ACGT"
 
-    # Rule groups (for scan mode)
     rule_groups = parse_rules_or(args)
     sanitized_groups: List[Dict[int, bytes]] = []
     for g in rule_groups:
@@ -543,23 +740,24 @@ def main() -> None:
         if sg:
             sanitized_groups.append(sg)
     rule_groups = sanitized_groups
-
     allowed_groups = [build_allowed_arrays(k, g) for g in rule_groups]
     user_provided_rules = bool(args.mask or args.rule)
 
-    # Output setup
+    prefixes_set: Set[bytes] = set()
+    if not rule_groups:
+        prefixes = [b""]
+    else:
+        for g in rule_groups:
+            P_g = choose_prefix_len(g, k, args.max_enum, alphabet)
+            for pref in enumerated_prefixes(P_g, g, alphabet):
+                prefixes_set.add(pref)
+        prefixes = sorted(prefixes_set) if prefixes_set else [b""]
+
     out = sys.stdout
     _fh = None
     if args.output:
-        _fh = open(args.output, "w")
+        _fh = open(args.output, "w", buffering=1024 * 1024)
         out = _fh
-
-    # Value decoder
-    if args.values == "auto":
-        decoder = ValueDecoder.infer_from_cf(cf)
-        sys.stderr.write(f"[kgrep] values=auto → inferred {decoder.mode}\n")
-    else:
-        decoder = ValueDecoder(args.values)
 
     ro = ReadOptions()
     _try_call(ro, ["set_readahead_size", "readahead_size"], args.readahead)
@@ -575,133 +773,21 @@ def main() -> None:
     _try_call(ro, ["set_fill_cache", "fill_cache"], False)
 
     printed = 0
-    seen_inputs: Set[bytes] = set()        # de-duplicate input queries
-    seen_outputs: Set[bytes] = set()       # de-duplicate printed DB keys
-    hits_by_input: Dict[bytes, bool] = {}  # per-input hit (exact or RC)
-
-    # --------------- CHUNK RETRIEVAL MODE ---------------
-    if chunk_keys:
-        # Validate lengths vs k
-        bad = [kk for kk in chunk_keys if len(kk) != k]
-        if bad:
-            sys.stderr.write(f"[kgrep] error: some provided kmers have length != {k}\n")
-            db.close()
-            if _fh:
-                _fh.close()
-            sys.exit(2)
-
-        # Fast point prober with caching (accelerates --rc significantly)
-        prober = Prober(cf, ro, allow_rc=args.rc, chunks_hex=args.chunks_hex, k=k)
-
-        total = len(chunk_keys)
-
-        # Progress settings
-        show_progress = bool(args.progress)
-        step = args.progress_step if 1 <= args.progress_step <= 100 else 5
-        next_threshold = step
-
-        for idx, kmer in enumerate(chunk_keys, start=1):
-            if kmer not in seen_inputs:
-                seen_inputs.add(kmer)
-                hits_by_input[kmer] = False  # default
-
-                found, found_key, val_bytes = prober.probe(kmer)
-
-                if found:
-                    hits_by_input[kmer] = True
-                    if found_key not in seen_outputs:
-                        # Ensure val_bytes is bytes
-                        if isinstance(val_bytes, bytearray):
-                            vb = bytes(val_bytes)
-                        elif isinstance(val_bytes, memoryview):
-                            vb = val_bytes.tobytes()
-                        else:
-                            vb = val_bytes  # type: ignore[assignment]
-                        cnt = None if decoder.mode == "none" else decoder.decode(vb)  # type: ignore[arg-type]
-                        if cnt is None or cnt >= args.min_count:
-                            seen_outputs.add(found_key)  # type: ignore[arg-type]
-                            try:
-                                s_key = found_key.decode("ascii")  # type: ignore[union-attr]
-                            except UnicodeDecodeError:
-                                s_key = found_key.hex()  # type: ignore[union-attr]
-                            if cnt is None:
-                                print(f"{s_key}", file=out)
-                            else:
-                                print(f"{s_key}\t{cnt}", file=out)
-                            printed += 1
-                            if args.limit and printed >= args.limit:
-                                if show_progress:
-                                    pct = int(idx * 100 / total)
-                                    sys.stderr.write(f"\r[kgrep] chunks: {idx}/{total} ({pct}%)\n")
-                                unique_inputs_so_far = len(hits_by_input)
-                                not_found_so_far = sum(1 for v in hits_by_input.values() if not v)
-                                sys.stderr.write(
-                                    f"[kgrep] not found (partial, limit reached): "
-                                    f"{not_found_so_far}/{unique_inputs_so_far}\n"
-                                )
-                                sys.stderr.flush()
-                                db.close()
-                                if _fh:
-                                    _fh.close()
-                                return
-                # else: missing (both k and rc) -> accounted at the end
-
-            if show_progress:
-                pct = int(idx * 100 / total)
-                if pct >= next_threshold or idx == total:
-                    sys.stderr.write(f"\r[kgrep] chunks: {idx}/{total} ({pct}%)")
-                    sys.stderr.flush()
-                    while next_threshold <= pct:
-                        next_threshold += step
-
-        if show_progress:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
-
-        # Final missing count report (to stderr): per input (exact or RC)
-        unique_inputs = len(hits_by_input)
-        not_found = sum(1 for v in hits_by_input.values() if not v)
-        sys.stderr.write(f"[kgrep] not found: {not_found}/{unique_inputs}\n")
-        sys.stderr.flush()
-
-        db.close()
-        if _fh:
-            _fh.close()
-        return
-    # --------------- End: CHUNK RETRIEVAL MODE ---------------
-
-    # --------- Original scan/enumeration mode (unchanged) ---------
-    prefixes_set: Set[bytes] = set()
-    if not rule_groups:
-        prefixes = [b""]
-    else:
-        for g in rule_groups:
-            P_g = choose_prefix_len(g, k, args.max_enum, alphabet)
-            for pref in enumerated_prefixes(P_g, g, alphabet):
-                prefixes_set.add(pref)
-        prefixes = sorted(prefixes_set) if prefixes_set else [b""]
-
     for pref in prefixes:
         lo, hi = seek_range_for_prefix(pref, k)
         _set_bound(ro, "lower", lo)
         _set_bound(ro, "upper", hi)
 
-    it = cf.iter(ro)
-    it.seek_to_first()
+        it = cf.iter(ro)
+        it.seek(lo)
 
-    while it.valid():
-        key = it.key()
-        if len(key) != k or (prefixes != [b""] and not any(key.startswith(p) for p in prefixes)):
-            it.next()
-            continue
-        if key in seen_outputs:
-            it.next()
-            continue
-        if match_kmer_bytes_any(key, allowed_groups, user_provided_rules=user_provided_rules):
-            val = it.value()
-            cnt = None if decoder.mode == "none" else decoder.decode(val)
-            if cnt is None or cnt >= args.min_count:
-                seen_outputs.add(key)
+        while it.valid():
+            key = it.key()
+            if len(key) != k or not key.startswith(pref):
+                break
+            if match_kmer_bytes_any(key, allowed_groups, user_provided_rules=user_provided_rules):
+                val = it.value()
+                cnt = None if decoder.mode == "none" else decoder.decode(val)
                 try:
                     s = key.decode("ascii")
                 except UnicodeDecodeError:
@@ -716,7 +802,7 @@ def main() -> None:
                     if _fh:
                         _fh.close()
                     return
-        it.next()
+            it.next()
 
     db.close()
     if _fh:
