@@ -69,6 +69,9 @@ kgrep --db /path/dbfolder --chunks AAAAC --chunks TTTTG,CCCCA
 # From a file (one kmer per line; lines starting with '#' are ignored)
 kgrep --db /path/dbfolder --chunks-file kmers.txt
 
+# --rc flag can be used to also search for reverse complements
+kgrep --db /path/dbfolder --chunks-file kmers.txt --rc
+
 # From STDIN
 cat kmers.txt | kgrep --db /path/dbfolder --chunks-file -
 
@@ -87,6 +90,11 @@ kgrep --db /path/dbfolder --chunks-hex --chunks 0x4141414143 --chunks 7474745447
 - Missing keys are skipped silently (no output line).
 - Duplicates are de-duplicated.
 - `--limit` still applies to the number of printed lines.
+- Optional progress reporting is available with:
+    ```bash
+    kgrep --db /path/dbfolder --chunks-file kmers.txt --progress
+    ```
+    which shows percentage completion on stderr. You can control update frequency with `--progress-step N` (default: 5%).
 
 ## Mask Syntax
 
@@ -124,6 +132,4 @@ to see all options.
 ## License
 
 MIT License — see repository for details.
-
-
 

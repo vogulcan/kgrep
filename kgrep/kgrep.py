@@ -16,8 +16,12 @@ def _try_call(obj, candidates: Iterable[str], *args) -> bool:
     for name in candidates:
         fn = getattr(obj, name, None)
         if callable(fn):
-            fn(*args)
-            return True
+            try:
+                fn(*args)
+                return True
+            except TypeError:
+                # Signature mismatch on this variant; try next
+                continue
     return False
 
 
@@ -353,6 +357,106 @@ def ensure_same_length(keys: List[bytes]) -> Optional[int]:
     return next(iter(lens))
 
 
+# ---------- Reverse-complement helpers ----------
+_RC_TABLE = bytes.maketrans(b"ACGTacgt", b"TGCAtgca")
+
+
+def reverse_complement_bytes(seq: bytes) -> Optional[bytes]:
+    """Return reverse-complement for ASCII A/C/G/T strings; None if other chars present."""
+    if not seq:
+        return b""
+    for bch in seq:
+        if bch not in b"ACGTacgt":
+            return None
+    return seq.translate(_RC_TABLE)[::-1]
+
+
+# ---------- Point lookup helper with robust get & caching ----------
+def _is_byteslike(x) -> bool:
+    return isinstance(x, (bytes, bytearray, memoryview))
+
+
+class Prober:
+    """
+    Fast point lookups with caching. Uses cf.get if available (robust to different
+    signatures), otherwise falls back to iterator seek. Caches results for both
+    k and rc(k) to avoid duplicate work (big speed-up with --rc).
+    """
+    def __init__(self, cf, ro: ReadOptions, allow_rc: bool, chunks_hex: bool, k: int):
+        self.cf = cf
+        self.ro = ro
+        self.allow_rc = allow_rc
+        self.rc_enabled = allow_rc and not chunks_hex  # rc disabled for hex inputs
+        self.k = k
+        self._get_fn = getattr(cf, "get", None)
+        self._cache: Dict[bytes, Tuple[bool, Optional[bytes], Optional[bytes]]] = {}
+        # maps key -> (found?, found_key, value_bytes)
+
+        if allow_rc and chunks_hex:
+            sys.stderr.write("[kgrep] --rc ignored for hex inputs; cannot compute reverse complement.\n")
+
+    def _point_get(self, key: bytes) -> Optional[bytes]:
+        # Prefer direct get if available (much faster than iterator seek for point lookups)
+        fn = self._get_fn
+        if callable(fn):
+            # Try common signatures; accept only bytes-like or None results
+            for args in ((key,), (key, self.ro), (self.ro, key)):
+                try:
+                    val = fn(*args)
+                except TypeError:
+                    continue
+                if _is_byteslike(val) or val is None:
+                    if isinstance(val, bytearray):
+                        return bytes(val)
+                    if isinstance(val, memoryview):
+                        return val.tobytes()
+                    return val
+                # If result is not bytes-like (e.g., returns ReadOptions due to wrong arg order),
+                # keep trying other signatures.
+        # Fallback: iterator seek
+        it = self.cf.iter(self.ro)
+        it.seek(key)
+        if it.valid() and it.key() == key:
+            return it.value()
+        return None
+
+    def probe(self, kmer: bytes) -> Tuple[bool, Optional[bytes], Optional[bytes]]:
+        """
+        Returns (found, found_key, value_bytes).
+        found_key is the DB key that matched (kmer or its rc).
+        """
+        cached = self._cache.get(kmer)
+        if cached is not None:
+            return cached
+
+        # Try exact
+        val = self._point_get(kmer)
+        if val is not None:
+            res = (True, kmer, val)
+            self._cache[kmer] = res
+            return res
+
+        # Try RC if enabled
+        if self.rc_enabled:
+            rc = reverse_complement_bytes(kmer)
+            if rc is not None and len(rc) == self.k:
+                cached_rc = self._cache.get(rc)
+                if cached_rc is not None:
+                    # Mirror to kmer key as well
+                    self._cache[kmer] = cached_rc
+                    return cached_rc
+                val_rc = self._point_get(rc)
+                if val_rc is not None:
+                    res = (True, rc, val_rc)
+                    self._cache[kmer] = res
+                    self._cache[rc] = res
+                    return res
+
+        res = (False, None, None)
+        self._cache[kmer] = res
+        return res
+
+
 # ---------- Main ----------
 def main() -> None:
     ap = argparse.ArgumentParser(description="k-mer grep over RocksDict")
@@ -372,20 +476,36 @@ def main() -> None:
     ap.add_argument("--pin", action="store_true")
     ap.add_argument("--async-io", action="store_true")
     ap.add_argument("--output", default=None)
+    ap.add_argument("--read-only", action="store_true",
+                    help="Open DB in read-only mode (allows parallel readers without taking the lock).")
 
-    # ------- New: chunk retrieval options -------
+    # ------- Chunk retrieval options -------
     ap.add_argument("--chunks", action="append", default=None,
                     help="List of kmers to retrieve (ASCII). Can be provided multiple times or comma-separated.")
     ap.add_argument("--chunks-file", default=None,
                     help="Path to file with one kmer per line (use '-' for stdin).")
     ap.add_argument("--chunks-hex", action="store_true",
                     help="Interpret provided kmers as hex-encoded bytes (0x prefix optional).")
-    # --------------------------------------------
+    ap.add_argument("--progress", action="store_true",
+                    help="Show progress on stderr during chunk retrieval.")
+    ap.add_argument("--progress-step", type=int, default=5,
+                    help="Update progress every N percent (1-100) when --progress is set.")
+    ap.add_argument("--rc", action="store_true",
+                    help="If exact kmer not found, try reverse-complement lookup (ACGT only).")
+    # --------------------------------------
 
     args = ap.parse_args()
 
     opts = Options() if args.no_raw else Options(raw_mode=True)
-    db = Rdict(args.db, options=opts)
+
+    # Try to open read-only if requested and supported
+    try:
+        db = Rdict(args.db, options=opts, read_only=bool(args.read_only))
+    except TypeError:
+        if args.read_only:
+            sys.stderr.write("[kgrep] --read-only requested but not supported by this rocksdict version.\n")
+        db = Rdict(args.db, options=opts)
+
     cf = db if args.cf is None else db.get_column_family(args.cf)
 
     # Load chunks (if any) BEFORE determining k
@@ -455,9 +575,11 @@ def main() -> None:
     _try_call(ro, ["set_fill_cache", "fill_cache"], False)
 
     printed = 0
-    seen_keys: Set[bytes] = set()  # deduplication
+    seen_inputs: Set[bytes] = set()        # de-duplicate input queries
+    seen_outputs: Set[bytes] = set()       # de-duplicate printed DB keys
+    hits_by_input: Dict[bytes, bool] = {}  # per-input hit (exact or RC)
 
-    # --------------- New: CHUNK RETRIEVAL MODE ---------------
+    # --------------- CHUNK RETRIEVAL MODE ---------------
     if chunk_keys:
         # Validate lengths vs k
         bad = [kk for kk in chunk_keys if len(kk) != k]
@@ -468,37 +590,79 @@ def main() -> None:
                 _fh.close()
             sys.exit(2)
 
-        it = cf.iter(ro)
-        for kmer in chunk_keys:
-            if kmer in seen_keys:
-                continue
-            seen_keys.add(kmer)
+        # Fast point prober with caching (accelerates --rc significantly)
+        prober = Prober(cf, ro, allow_rc=args.rc, chunks_hex=args.chunks_hex, k=k)
 
-            # Seek to exact key using iterator for maximum API compatibility
-            it.seek(kmer)
-            if it.valid() and it.key() == kmer:
-                val = it.value()
-                cnt = None if decoder.mode == "none" else decoder.decode(val)
-                if cnt is None or cnt >= args.min_count:
-                    try:
-                        s_key = kmer.decode("ascii")
-                    except UnicodeDecodeError:
-                        s_key = kmer.hex()
-                    if cnt is None:
-                        # Keep original semantics: if values=none, print only key
-                        print(f"{s_key}", file=out)
-                    else:
-                        print(f"{s_key}\t{cnt}", file=out)
-                    printed += 1
-                    if args.limit and printed >= args.limit:
-                        db.close()
-                        if _fh:
-                            _fh.close()
-                        return
-            else:
-                # Key not present: still emit a line indicating absence?
-                # Preserve non-intrusive behavior: just skip silently.
-                continue
+        total = len(chunk_keys)
+
+        # Progress settings
+        show_progress = bool(args.progress)
+        step = args.progress_step if 1 <= args.progress_step <= 100 else 5
+        next_threshold = step
+
+        for idx, kmer in enumerate(chunk_keys, start=1):
+            if kmer not in seen_inputs:
+                seen_inputs.add(kmer)
+                hits_by_input[kmer] = False  # default
+
+                found, found_key, val_bytes = prober.probe(kmer)
+
+                if found:
+                    hits_by_input[kmer] = True
+                    if found_key not in seen_outputs:
+                        # Ensure val_bytes is bytes
+                        if isinstance(val_bytes, bytearray):
+                            vb = bytes(val_bytes)
+                        elif isinstance(val_bytes, memoryview):
+                            vb = val_bytes.tobytes()
+                        else:
+                            vb = val_bytes  # type: ignore[assignment]
+                        cnt = None if decoder.mode == "none" else decoder.decode(vb)  # type: ignore[arg-type]
+                        if cnt is None or cnt >= args.min_count:
+                            seen_outputs.add(found_key)  # type: ignore[arg-type]
+                            try:
+                                s_key = found_key.decode("ascii")  # type: ignore[union-attr]
+                            except UnicodeDecodeError:
+                                s_key = found_key.hex()  # type: ignore[union-attr]
+                            if cnt is None:
+                                print(f"{s_key}", file=out)
+                            else:
+                                print(f"{s_key}\t{cnt}", file=out)
+                            printed += 1
+                            if args.limit and printed >= args.limit:
+                                if show_progress:
+                                    pct = int(idx * 100 / total)
+                                    sys.stderr.write(f"\r[kgrep] chunks: {idx}/{total} ({pct}%)\n")
+                                unique_inputs_so_far = len(hits_by_input)
+                                not_found_so_far = sum(1 for v in hits_by_input.values() if not v)
+                                sys.stderr.write(
+                                    f"[kgrep] not found (partial, limit reached): "
+                                    f"{not_found_so_far}/{unique_inputs_so_far}\n"
+                                )
+                                sys.stderr.flush()
+                                db.close()
+                                if _fh:
+                                    _fh.close()
+                                return
+                # else: missing (both k and rc) -> accounted at the end
+
+            if show_progress:
+                pct = int(idx * 100 / total)
+                if pct >= next_threshold or idx == total:
+                    sys.stderr.write(f"\r[kgrep] chunks: {idx}/{total} ({pct}%)")
+                    sys.stderr.flush()
+                    while next_threshold <= pct:
+                        next_threshold += step
+
+        if show_progress:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        # Final missing count report (to stderr): per input (exact or RC)
+        unique_inputs = len(hits_by_input)
+        not_found = sum(1 for v in hits_by_input.values() if not v)
+        sys.stderr.write(f"[kgrep] not found: {not_found}/{unique_inputs}\n")
+        sys.stderr.flush()
 
         db.close()
         if _fh:
@@ -522,36 +686,37 @@ def main() -> None:
         _set_bound(ro, "lower", lo)
         _set_bound(ro, "upper", hi)
 
-        it = cf.iter(ro)
-        it.seek(lo)
+    it = cf.iter(ro)
+    it.seek_to_first()
 
-        while it.valid():
-            key = it.key()
-            if len(key) != k or not key.startswith(pref):
-                break
-            if key in seen_keys:
-                it.next()
-                continue
-            if match_kmer_bytes_any(key, allowed_groups, user_provided_rules=user_provided_rules):
-                val = it.value()
-                cnt = None if decoder.mode == "none" else decoder.decode(val)
-                if cnt is None or cnt >= args.min_count:
-                    seen_keys.add(key)
-                    try:
-                        s = key.decode("ascii")
-                    except UnicodeDecodeError:
-                        s = key.hex()
-                    if cnt is None:
-                        print(s, file=out)
-                    else:
-                        print(f"{s}\t{cnt}", file=out)
-                    printed += 1
-                    if args.limit and printed >= args.limit:
-                        db.close()
-                        if _fh:
-                            _fh.close()
-                        return
+    while it.valid():
+        key = it.key()
+        if len(key) != k or (prefixes != [b""] and not any(key.startswith(p) for p in prefixes)):
             it.next()
+            continue
+        if key in seen_outputs:
+            it.next()
+            continue
+        if match_kmer_bytes_any(key, allowed_groups, user_provided_rules=user_provided_rules):
+            val = it.value()
+            cnt = None if decoder.mode == "none" else decoder.decode(val)
+            if cnt is None or cnt >= args.min_count:
+                seen_outputs.add(key)
+                try:
+                    s = key.decode("ascii")
+                except UnicodeDecodeError:
+                    s = key.hex()
+                if cnt is None:
+                    print(s, file=out)
+                else:
+                    print(f"{s}\t{cnt}", file=out)
+                printed += 1
+                if args.limit and printed >= args.limit:
+                    db.close()
+                    if _fh:
+                        _fh.close()
+                    return
+        it.next()
 
     db.close()
     if _fh:
